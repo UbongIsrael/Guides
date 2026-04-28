@@ -752,7 +752,7 @@ echo $OLLAMA_MODELS
 Built and maintained by **Sheikh** (Digital Sheikh)
 
 - **X / Twitter:** [@0xBonge](https://x.com/0xBonge)
-- **Email:** [ubongisrael@gmail.com](mailto:sheikhthefather@gmail.com)
+- **Email:** [sheikhthefather@gmail.com](mailto:sheikhthefather@gmail.com)
 - **Portfolio:** [digitalsheikh.co](https://digitalsheikh.co)
 - **GitHub:** [github.com/UbongIsrael](https://github.com/UbongIsrael)
 
