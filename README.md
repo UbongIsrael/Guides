@@ -18,6 +18,17 @@ Covers GPU evaluation (VRAM, bandwidth, single vs multi-GPU, NVLink), model reco
 
 ---
 
+### 🖥️ [Linux Desktop Streaming — VPS Remote Desktop](./full-linux-desktop+stream/)
+
+> Set up a full Linux desktop on a cloud VPS, accessible via browser or VNC client. Uses Lubuntu + TigerVNC + noVNC.
+
+Covers use cases (region-bound access, persistent dev environments, privacy-sensitive browsing), server provider selection, Contabo recommendation with region picking guide, step-by-step setup, HTTPS configuration with custom domain, service management commands, and security considerations.
+
+**Tested on:** Contabo VPS, Pay as you Use GPUs on Vast.ai and OctaSpace Cube · Ubuntu 22.04/24.04
+**Script:** [`setup-desktop.sh`](./full-linux-desktop+stream/setup-desktop.sh)
+
+---
+
 ## About
 
 Written and maintained by **Sheikh** (Digital Sheikh)
