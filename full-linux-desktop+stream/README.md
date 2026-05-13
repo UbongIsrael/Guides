@@ -165,7 +165,7 @@ ssh root@YOUR_VPS_IP
 
 **Step 2 — Download the setup script**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/UbongIsrael/cloud-llm-setup/main/full-linux-desktop+stream/setup-desktop.sh -o setup-desktop.sh
+curl -fsSL https://raw.githubusercontent.com/UbongIsrael/Guides/main/full-linux-desktop+stream/setup-desktop.sh -o setup-desktop.sh
 ```
 
 **Step 3 — Run the script**
