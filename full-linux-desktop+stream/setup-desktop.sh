@@ -7,7 +7,7 @@
 # Tested on: Ubuntu 22.04 / 24.04
 # =============================================================================
 
-set -e
+# No set -e — we handle errors explicitly so one failure doesn't kill the run
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -42,7 +42,6 @@ USER_HOME=$(eval echo "~$RUN_USER")
 info "Running setup for user: ${BOLD}$RUN_USER${NC} (home: $USER_HOME)"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-VNC_DISPLAY=":1"
 VNC_PORT=5901
 NOVNC_PORT=6080
 RESOLUTION="1280x800"
@@ -86,12 +85,10 @@ done
 # CORE SETUP
 # =============================================================================
 
-# ── Step 1: System update ─────────────────────────────────────────────────────
 section "[1/6] Updating system packages..."
 apt-get update -qq && apt-get upgrade -y -qq
 log "System updated"
 
-# ── Step 2: Lubuntu desktop ───────────────────────────────────────────────────
 section "[2/6] Installing Lubuntu desktop (LXQt)..."
 info "This may take a few minutes..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
@@ -99,17 +96,14 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     --no-install-recommends
 log "Lubuntu desktop installed"
 
-# ── Step 3: TigerVNC ─────────────────────────────────────────────────────────
 section "[3/6] Installing TigerVNC server..."
 apt-get install -y -qq tigervnc-standalone-server tigervnc-common
 log "TigerVNC installed"
 
-# ── Step 4: noVNC + websockify ────────────────────────────────────────────────
 section "[4/6] Installing noVNC + websockify..."
 apt-get install -y -qq novnc python3-websockify
 log "noVNC installed"
 
-# ── Step 5: Configure VNC ─────────────────────────────────────────────────────
 section "[5/6] Configuring VNC..."
 
 mkdir -p "$USER_HOME/.vnc"
@@ -134,7 +128,6 @@ chmod +x "$USER_HOME/.vnc/xstartup"
 chown -R "$RUN_USER:$RUN_USER" "$USER_HOME/.vnc"
 log "VNC config written to $USER_HOME/.vnc/"
 
-# ── Step 6: Systemd services ──────────────────────────────────────────────────
 section "[6/6] Creating systemd services..."
 
 # Detect novnc_proxy path
@@ -149,6 +142,9 @@ done
 info "noVNC proxy at: $NOVNC_PROXY"
 
 # VNC server service
+# Note: PIDFile is intentionally omitted — newer TigerVNC versions write the
+# PID file with a different naming scheme than systemd expects, causing false
+# failures even when the server is running fine.
 cat > /etc/systemd/system/vncserver@.service << EOF
 [Unit]
 Description=TigerVNC server (display %i)
@@ -158,7 +154,6 @@ After=syslog.target network.target
 Type=forking
 User=$RUN_USER
 WorkingDirectory=$USER_HOME
-PIDFile=$USER_HOME/.vnc/%H:%i.pid
 ExecStartPre=-/usr/bin/vncserver -kill :%i > /dev/null 2>&1
 ExecStart=/usr/bin/vncserver \\
     -depth $COLOR_DEPTH \\
@@ -173,7 +168,13 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# noVNC service — binds to localhost only (nginx proxies it if HTTPS chosen)
+# noVNC service — binds to localhost only when HTTPS is chosen, all interfaces otherwise
+if [[ "$INSTALL_HTTPS" == "y" ]]; then
+    NOVNC_LISTEN="127.0.0.1:$NOVNC_PORT"
+else
+    NOVNC_LISTEN="$NOVNC_PORT"
+fi
+
 cat > /etc/systemd/system/novnc.service << EOF
 [Unit]
 Description=noVNC WebSocket proxy
@@ -185,7 +186,7 @@ Type=simple
 User=$RUN_USER
 ExecStart=$NOVNC_PROXY \\
     --vnc localhost:$VNC_PORT \\
-    --listen 127.0.0.1:$NOVNC_PORT
+    --listen $NOVNC_LISTEN
 Restart=on-failure
 RestartSec=5
 
@@ -196,13 +197,35 @@ EOF
 systemctl daemon-reload
 systemctl enable vncserver@1.service
 systemctl enable novnc.service
-systemctl start vncserver@1.service
 
-info "Waiting for VNC to initialize..."
-sleep 4
+# Start VNC and wait for it to bind to its port
+info "Starting VNC server..."
+systemctl start vncserver@1.service || true
+info "Waiting for VNC to bind to port $VNC_PORT..."
+for i in $(seq 1 15); do
+    ss -tlnp | grep -q ":$VNC_PORT" && break
+    sleep 1
+done
 
-systemctl start novnc.service
-log "Core services started"
+if ! ss -tlnp | grep -q ":$VNC_PORT"; then
+    warn "VNC did not bind to port $VNC_PORT in time."
+    warn "Check logs: journalctl -u vncserver@1 -n 30"
+    warn "Or manually: cat $USER_HOME/.vnc/*.log"
+    warn "Continuing — fix VNC then run: systemctl start novnc.service"
+else
+    log "VNC is listening on port $VNC_PORT"
+fi
+
+# Start noVNC and verify
+info "Starting noVNC..."
+systemctl start novnc.service || true
+sleep 3
+
+if ss -tlnp | grep -q ":$NOVNC_PORT"; then
+    log "noVNC is listening on port $NOVNC_PORT"
+else
+    warn "noVNC did not start. Check: journalctl -u novnc -n 30"
+fi
 
 # =============================================================================
 # OPTIONAL: Google Chrome (.deb binary)
@@ -212,18 +235,13 @@ if [[ "$INSTALL_CHROME" == "y" ]]; then
     info "Downloading Chrome .deb directly from Google..."
 
     CHROME_DEB="/tmp/google-chrome-stable.deb"
-
-    # Pull the .deb straight from Google — no snap, no PPA, no middlemen
     curl -fsSL -o "$CHROME_DEB" \
         "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
 
-    # Install and auto-resolve any missing dependencies
     apt-get install -y -qq "$CHROME_DEB" || apt-get install -f -y -qq
-
     rm -f "$CHROME_DEB"
 
     # Chrome refuses to launch as root without --no-sandbox
-    # Create a wrapper so it just works without manual flags every time
     if [[ "$RUN_USER" == "root" ]]; then
         cat > /usr/local/bin/chrome << 'WRAPPER'
 #!/bin/bash
@@ -231,11 +249,9 @@ if [[ "$INSTALL_CHROME" == "y" ]]; then
 WRAPPER
         chmod +x /usr/local/bin/chrome
         warn "Running as root — '--no-sandbox' wrapper created at /usr/local/bin/chrome"
-        warn "Consider creating a non-root user for desktop sessions in production."
     fi
 
     log "Google Chrome installed (binary .deb)"
-    info "Launch from the desktop app menu or terminal: google-chrome-stable"
 fi
 
 # =============================================================================
@@ -246,44 +262,23 @@ if [[ "$INSTALL_HTTPS" == "y" ]]; then
 
     apt-get install -y -qq nginx certbot python3-certbot-nginx
 
-    # nginx config: reverse proxy noVNC with WebSocket support
+    # HTTP-only config first — certbot will inject the SSL block itself
+    # Do NOT pre-write the ssl_certificate lines before the cert exists
     cat > /etc/nginx/sites-available/novnc << EOF
 server {
     listen 80;
     server_name $DOMAIN_NAME;
 
-    # Certbot challenge passthrough
     location /.well-known/acme-challenge/ {
         root /var/www/html;
     }
 
-    # Redirect all HTTP to HTTPS
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl;
-    server_name $DOMAIN_NAME;
-
-    # SSL (populated by certbot)
-    ssl_certificate     /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem;
-    include             /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
-
-    # Proxy to noVNC
     location / {
         proxy_pass         http://127.0.0.1:$NOVNC_PORT;
         proxy_http_version 1.1;
-
-        # WebSocket upgrade headers — noVNC will not work without these
         proxy_set_header Upgrade    \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host       \$host;
-
-        # Long timeouts so the session doesn't drop
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
     }
@@ -293,37 +288,40 @@ EOF
     ln -sf /etc/nginx/sites-available/novnc /etc/nginx/sites-enabled/novnc
     rm -f /etc/nginx/sites-enabled/default
 
-    nginx -t && systemctl reload nginx
-    log "nginx configured for $DOMAIN_NAME"
+    if nginx -t; then
+        systemctl enable --now nginx
+        log "nginx started"
+    else
+        warn "nginx config test failed — check /etc/nginx/sites-available/novnc"
+    fi
 
     info "Requesting SSL certificate from Let's Encrypt..."
-    certbot --nginx \
+    if certbot --nginx \
         -d "$DOMAIN_NAME" \
         --email "$LE_EMAIL" \
         --agree-tos \
         --non-interactive \
-        --redirect
-    log "SSL certificate issued"
+        --redirect; then
+        log "SSL certificate issued"
+        # Auto-renewal cron
+        (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | crontab -
+        log "SSL auto-renewal cron added (daily at 3am)"
+        ACCESS_URL="https://$DOMAIN_NAME/vnc.html"
+    else
+        warn "certbot failed — DNS may not have propagated yet."
+        warn "Once DNS is ready, run manually:"
+        warn "  certbot --nginx -d $DOMAIN_NAME --email $LE_EMAIL --agree-tos --non-interactive --redirect"
+        ACCESS_URL="http://$DOMAIN_NAME/vnc.html (HTTPS pending)"
+    fi
 
-    # Open HTTP/HTTPS ports in UFW
+    # Open HTTP/HTTPS in UFW
     if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
         ufw allow 80/tcp  > /dev/null
         ufw allow 443/tcp > /dev/null
         log "UFW: ports 80 and 443 opened"
     fi
 
-    # Daily auto-renewal cron
-    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet && systemctl reload nginx") | crontab -
-    log "SSL auto-renewal cron added (runs daily at 3am)"
-
-    ACCESS_URL="https://$DOMAIN_NAME/vnc.html"
-
 else
-    # No HTTPS — expose noVNC directly on all interfaces
-    sed -i "s/127.0.0.1:$NOVNC_PORT/$NOVNC_PORT/" /etc/systemd/system/novnc.service
-    systemctl daemon-reload
-    systemctl restart novnc.service
-
     if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
         ufw allow "$NOVNC_PORT/tcp" > /dev/null
         ufw allow "$VNC_PORT/tcp"   > /dev/null
@@ -338,43 +336,84 @@ else
     ACCESS_URL="http://$VPS_IP:$NOVNC_PORT/vnc.html"
 fi
 
-# ── Service status ────────────────────────────────────────────────────────────
-echo ""
-info "Service status:"
-systemctl is-active --quiet vncserver@1.service \
-    && echo -e "  ${GREEN}vncserver${NC}   running" \
-    || echo -e "  ${RED}vncserver${NC}   FAILED — run: journalctl -u vncserver@1 -n 30"
+# =============================================================================
+# FINAL HEALTH CHECK
+# =============================================================================
+section "Health Check"
 
-systemctl is-active --quiet novnc.service \
-    && echo -e "  ${GREEN}novnc${NC}       running" \
-    || echo -e "  ${RED}novnc${NC}       FAILED — run: journalctl -u novnc -n 30"
+HEALTH_OK=true
 
-[[ "$INSTALL_HTTPS" == "y" ]] && {
-    systemctl is-active --quiet nginx \
-        && echo -e "  ${GREEN}nginx${NC}       running" \
-        || echo -e "  ${RED}nginx${NC}       FAILED — run: journalctl -u nginx -n 30"
-}
+# VNC port
+if ss -tlnp | grep -q ":$VNC_PORT"; then
+    echo -e "  ${GREEN}[✔]${NC} VNC        — port $VNC_PORT bound"
+else
+    echo -e "  ${RED}[✘]${NC} VNC        — port $VNC_PORT NOT bound"
+    echo -e "       Fix: journalctl -u vncserver@1 -n 30"
+    echo -e "            cat $USER_HOME/.vnc/*.log"
+    HEALTH_OK=false
+fi
+
+# noVNC port
+if ss -tlnp | grep -q ":$NOVNC_PORT"; then
+    echo -e "  ${GREEN}[✔]${NC} noVNC      — port $NOVNC_PORT bound"
+else
+    echo -e "  ${RED}[✘]${NC} noVNC      — port $NOVNC_PORT NOT bound"
+    echo -e "       Fix: journalctl -u novnc -n 30"
+    HEALTH_OK=false
+fi
+
+# systemd service states
+for svc in vncserver@1 novnc; do
+    if systemctl is-active --quiet "$svc"; then
+        echo -e "  ${GREEN}[✔]${NC} $svc service — active"
+    else
+        echo -e "  ${RED}[✘]${NC} $svc service — INACTIVE"
+        HEALTH_OK=false
+    fi
+done
+
+# nginx (if installed)
+if [[ "$INSTALL_HTTPS" == "y" ]]; then
+    if systemctl is-active --quiet nginx; then
+        echo -e "  ${GREEN}[✔]${NC} nginx      — active"
+    else
+        echo -e "  ${RED}[✘]${NC} nginx      — INACTIVE"
+        echo -e "       Fix: journalctl -u nginx -n 30"
+        HEALTH_OK=false
+    fi
+fi
+
+# Chrome (if installed)
+if [[ "$INSTALL_CHROME" == "y" ]]; then
+    if command -v google-chrome-stable &>/dev/null; then
+        echo -e "  ${GREEN}[✔]${NC} Chrome     — installed"
+    else
+        echo -e "  ${YELLOW}[!]${NC} Chrome     — not found in PATH (may still be installed)"
+    fi
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo -e "\n${BOLD}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║              Setup Complete!             ║${NC}"
+if [[ "$HEALTH_OK" == "true" ]]; then
+    echo -e "${BOLD}║         Setup Complete — All Good!       ║${NC}"
+else
+    echo -e "${BOLD}║    Setup Done — Some Services Need Fix   ║${NC}"
+fi
 echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo -e ""
 echo -e "  ${BOLD}Desktop access:${NC}"
 echo -e "  ${YELLOW}$ACCESS_URL${NC}"
 echo -e ""
-[[ "$INSTALL_CHROME" == "y" ]] && \
-echo -e "  ${BOLD}Chrome:${NC}      installed (binary .deb)"
-[[ "$INSTALL_HTTPS"  == "y" ]] && \
-echo -e "  ${BOLD}HTTPS:${NC}       enabled — nginx + Let's Encrypt"
+[[ "$INSTALL_CHROME" == "y" ]] && echo -e "  ${BOLD}Chrome:${NC}      installed (binary .deb)"
+[[ "$INSTALL_HTTPS"  == "y" ]] && echo -e "  ${BOLD}HTTPS:${NC}       nginx + Let's Encrypt"
 echo -e "  ${BOLD}Resolution:${NC}  $RESOLUTION"
 echo -e "  ${BOLD}User:${NC}        $RUN_USER"
 echo -e ""
 echo -e "  ${CYAN}Useful commands:${NC}"
 echo -e "  systemctl status vncserver@1      # VNC status"
 echo -e "  systemctl status novnc            # noVNC status"
-echo -e "  systemctl restart vncserver@1     # restart VNC"
 echo -e "  vncserver -list                   # list active sessions"
+echo -e "  journalctl -u vncserver@1 -n 30   # VNC logs"
 [[ "$INSTALL_HTTPS" == "y" ]] && \
-echo -e "  certbot renew --dry-run           # test SSL auto-renewal"
+echo -e "  certbot renew --dry-run           # test SSL renewal"
 echo ""

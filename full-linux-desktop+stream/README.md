@@ -287,33 +287,195 @@ Useful commands for managing your desktop:
 
 ## 11. Troubleshooting
 
-**noVNC shows "Connecting..." but never connects**
-- Check that VNC is running: `systemctl status vncserver@1`
-- Check noVNC: `systemctl status novnc`
-- Check logs: `journalctl -u vncserver@1 -n 30`
+### noVNC shows "Failed to connect to server"
 
-**Black screen after connecting**
-- The VNC server started but the desktop environment didn't launch
-- Check `$HOME/.vnc/xstartup` exists and is executable
-- Try manually starting: `su - YOUR_USER -c "vncserver :1"`
+This is the most common issue and almost always means VNC is not actually listening on port 5901, even if `systemctl status vncserver@1` shows the service as active. Verify with:
 
-**Chrome won't launch as root**
-- The script creates a wrapper at `/usr/local/bin/chrome` with `--no-sandbox`
-- If running as a regular user, launch Chrome normally from the app menu
+```bash
+ss -tlnp | grep 5901
+```
 
-**Very slow desktop response**
+If that returns nothing, VNC is not bound. Check the VNC log:
+
+```bash
+cat ~/.vnc/*.log
+```
+
+Then kill any orphaned session and restart cleanly:
+
+```bash
+vncserver -kill :1
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+systemctl restart vncserver@1.service
+```
+
+Wait a few seconds then check `ss -tlnp | grep 5901` again.
+
+---
+
+### Script exits early with "Job for vncserver@1.service failed because a timeout was exceeded"
+
+This is a false failure caused by a PID file naming mismatch in newer TigerVNC versions. The VNC server actually starts fine but systemd can't find the PID file to confirm it, so it reports failure — and if you used `set -e`, the script exits before installing Chrome and nginx.
+
+**Fix:**
+```bash
+sed -i '/^PIDFile=/d' /etc/systemd/system/vncserver@.service
+systemctl daemon-reload
+vncserver -kill :1
+systemctl start vncserver@1.service
+```
+
+The updated `setup-desktop.sh` omits `PIDFile=` entirely to prevent this.
+
+---
+
+### nginx config fails with "No such file or directory" for SSL files
+
+If you write the full SSL server block into the nginx config *before* running certbot, nginx will fail to start because the certificate files don't exist yet.
+
+**Fix:** Use HTTP-only config first, then let certbot run and inject the SSL block itself:
+
+```bash
+# Overwrite with HTTP-only config
+cat > /etc/nginx/sites-available/novnc << 'EOF'
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        proxy_pass         http://127.0.0.1:6080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+}
+EOF
+
+nginx -t && systemctl restart nginx
+certbot --nginx -d YOUR_DOMAIN --email YOUR_EMAIL --agree-tos --non-interactive --redirect
+```
+
+The updated script handles this correctly by writing HTTP-only first.
+
+---
+
+### noVNC page loads but WebSocket connection fails (after nginx setup)
+
+If the noVNC page opens but hitting Connect does nothing or immediately fails, noVNC may be bound to `127.0.0.1` (localhost only) while nginx hasn't been configured yet — or vice versa, noVNC is on `0.0.0.0` but nginx is also trying to proxy it.
+
+Check what noVNC is actually listening on:
+```bash
+ss -tlnp | grep 6080
+```
+
+- If nginx is in use: noVNC should be on `127.0.0.1:6080`
+- If accessing directly via IP: noVNC should be on `0.0.0.0:6080` or just `6080`
+
+To fix the binding:
+```bash
+# For nginx reverse proxy (HTTPS setup):
+sed -i 's/--listen [0-9.]*:*6080/--listen 127.0.0.1:6080/' /etc/systemd/system/novnc.service
+
+# For direct IP access (no nginx):
+sed -i 's/--listen [0-9.]*:*6080/--listen 6080/' /etc/systemd/system/novnc.service
+
+systemctl daemon-reload && systemctl restart novnc.service
+```
+
+---
+
+### certbot fails — "Could not be resolved" or "Connection refused"
+
+certbot validates your domain by making an HTTP request to it. It will fail if:
+
+1. **DNS hasn't propagated** — Your A record was just added. Wait 5–15 minutes and retry.
+2. **Port 80 is blocked** — Your VPS provider may have a firewall panel separate from UFW. On Contabo, check the control panel firewall and ensure port 80 is open.
+
+Verify DNS before running certbot:
+```bash
+curl -s ifconfig.me     # your VPS IP
+dig +short YOUR_DOMAIN  # what DNS resolves to
+```
+
+Both must match.
+
+---
+
+### "A Xtigervnc server is already running" when starting manually
+
+An orphaned VNC session from a previous run is still registered. Clean it up:
+
+```bash
+vncserver -kill :1
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+vncserver :1 -depth 24 -geometry 1280x800
+```
+
+---
+
+### noVNC shows "Connecting..." but never connects
+
+- Check that VNC is running and bound: `ss -tlnp | grep 5901`
+- Check noVNC status: `systemctl status novnc`
+- Check VNC logs: `journalctl -u vncserver@1 -n 30`
+
+---
+
+### Black screen after connecting
+
+The VNC server started but the desktop environment didn't launch. Check `xstartup`:
+
+```bash
+cat ~/.vnc/xstartup
+which startlxqt
+```
+
+If `startlxqt` is missing, install it:
+```bash
+apt-get install -y lxqt
+```
+
+---
+
+### Chrome won't launch as root
+
+The setup script creates a wrapper at `/usr/local/bin/chrome` that passes `--no-sandbox` automatically. Run `chrome` from terminal or the app menu. If running as a non-root user, launch `google-chrome-stable` directly.
+
+---
+
+### VNC password rejected
+
+The password is stored in `~/.vnc/passwd`. Reset it with:
+```bash
+vncpasswd
+systemctl restart vncserver@1.service
+```
+
+---
+
+### Very slow desktop response
+
 - VPS specs too low — aim for 8GB+ RAM, 4 vCPU
-- High latency between you and the server region
-- Check network: ping your VPS IP
+- High latency between you and the server region — ping your VPS IP
+- Consider reducing resolution: edit the `RESOLUTION` variable in the service or restart with `-geometry 1024x768`
 
-**SSL certificate renewal failing**
-- Check certbot logs: `journalctl -u certbot`
-- Ensure port 80 is open for Let's Encrypt challenges
-- Test renewal: `certbot renew --dry-run`
+---
 
-**VNC password rejected**
-- The password is stored in `$HOME/.vnc/passwd`
-- Re-run with a new password or manually reset with `vncpasswd`
+### SSL certificate renewal failing
+
+```bash
+certbot renew --dry-run          # test renewal
+journalctl -u certbot -n 30      # view certbot logs
+```
+
+Ensure port 80 is open — Let's Encrypt needs it for HTTP challenges even when your site is HTTPS.
 
 ---
 
